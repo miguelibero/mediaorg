@@ -3,10 +3,10 @@ import magic
 import os
 import piexif
 from datetime import datetime
+import time
 import shutil
 import re
 import parsedatetime
-
 
 class DatetimePattern:
     """
@@ -69,11 +69,12 @@ class DatetimePattern:
             s = m.span(len(phs)-i)
             timefrmt = timefrmt[0:s[0]] + ph + timefrmt[s[1]:]
             i += 1
-        time = datetime.strptime(string, timefrmt)
+        val = datetime.strptime(string, timefrmt)
         if self.__timefmt:
             cal = parsedatetime.Calendar()
-            time = cal.parse(time.strftime(self.__timefmt))
-        return time
+            val, _ = cal.parse(val.strftime(self.__timefmt))
+            val = datetime.fromtimestamp(time.mktime(val))
+        return val
 
     def search(self, string):
         m = re.search(self.__re, string)
@@ -124,7 +125,15 @@ class Organizer:
             pass
 
     def __save_exif_datetime(self, path, time):
-        pass
+        try:
+            data = piexif.load(path)
+        except Exception:
+            return
+        if self.EXIF_TAG not in data:
+            data[self.EXIF_TAG] = {}
+        exif = data[self.EXIF_TAG]
+        exif[self.DATETIME_ID] = time.strftime(self.EXIF_DATE_FORMAT)
+        piexif.insert(piexif.dump(data), path)
 
     def __get_pattern_datetime(self, path, patterns):
         for pattern in patterns:
@@ -134,10 +143,12 @@ class Organizer:
         return (None, None)
 
     def __get_output_path(self, path, time, pattern):
+        _, ext = os.path.splitext(path)
+        ext = ext.lower() if ext else ""
         return pattern.format(
             time=time,
             filename=os.path.basename(path),
-            ext=os.path.splitext(path)[1].lower()
+            ext=ext
         )
 
     def __log(self, msg, *args):
@@ -146,7 +157,7 @@ class Organizer:
     def __process(
         self, path, outpattern, fromdir,
         inpatterns=None, outdir=None, faildir=None,
-        dry=False, verbose=False,
+        dry=False, verbose=False, move=False
     ):
         save = False
         time = self.__get_exif_datetime(path)
@@ -158,7 +169,7 @@ class Organizer:
                 save = True
                 if verbose:
                     self.__log("%s: %s %s", path, pattern, time)
-        
+
         opath = None
         if time:
             opath = self.__get_output_path(path, time, outpattern)
@@ -170,20 +181,27 @@ class Organizer:
 
         if not opath:
             return None
-
         opath = os.path.join(outdir, opath)
-        i = 1
-        bopath, ext = os.path.splitext(opath)
-        while opath in self.__opaths:
-            opath = "%s-%s%s" % (bopath, i, ext)
-            i += 1
-        if verbose:
-            self.__log("%s -> %s", path, opath)
+        if opath == path:
+            if verbose:
+                self.__log("skipping %s...", opath)
+        else:
+            i = 1
+            bopath, ext = os.path.splitext(opath)
+            while opath in self.__opaths or os.path.exists(opath):
+                opath = "%s-%s%s" % (bopath, i, ext)
+                i += 1
+            if verbose:
+                self.__log("%s -> %s", path, opath)
         if not dry:
-            odir = os.path.dirname(opath)
-            if odir:
-                os.makedirs(odir, exist_ok=True)
-            shutil.copyfile(path, opath)
+            if opath != path:
+                odir = os.path.dirname(opath)
+                if odir:
+                    os.makedirs(odir, exist_ok=True)
+                if move:
+                    shutil.move(path, opath)
+                else:
+                    shutil.copyfile(path, opath)
             if save:
                 if verbose:
                     self.__log("saving %s %s...", opath, time)
@@ -194,11 +212,20 @@ class Organizer:
     def run(self, args):
         self.__opaths = []
         inpatterns = list(self.FILE_PATTERNS)
-        for pattern in args.inpattern:
-            inpatterns.append(DatetimePattern(pattern))
+        if args.inpattern:
+            for pattern in args.inpattern:
+                inpatterns.append(DatetimePattern(pattern))
         for fromdir in args.path:
-            print("processing %s to %s..." % (fromdir, args.outdir))
-            outdir = os.path.join(fromdir, args.outdir)
+            if args.outdir:
+                outdir = os.path.join(fromdir, args.outdir)
+            else:
+                outdir = fromdir
+            
+            move = outdir == fromdir
+            if outdir == fromdir:
+                print("processing %s..." % (fromdir,))
+            else:
+                print("processing %s to %s..." % (fromdir, outdir))
             faildir = os.path.join(outdir, args.faildir)
             for froot, _, fpaths in os.walk(fromdir):
                 for fpath in fpaths:
@@ -214,7 +241,8 @@ class Organizer:
                         outdir=outdir,
                         faildir=faildir,
                         dry=args.dry,
-                        verbose=args.verbose)
+                        verbose=args.verbose,
+                        move=move)
                     if opath:
                         self.__opaths.append(opath)
 
@@ -223,7 +251,7 @@ def main():
     parser = argparse.ArgumentParser(
         description='organize your photo collection')
     parser.add_argument(
-        'path', nargs='+', help='directory with photos', default='.')
+        'path', action='append', help='directory with photos', default=[])
     parser.add_argument(
         '-o,--outdir', dest='outdir', help='output directory')
     parser.add_argument(
@@ -239,7 +267,7 @@ def main():
         '-f,--faildir', dest='faildir', help='fail output directory',
         default="./failed")
     parser.add_argument(
-        '--inpattern', nargs='+', dest="inpattern",
+        '--inpattern', action='append', dest="inpattern",
         help='add aditional path pattern to find datetime')
     args = parser.parse_args()
     org = Organizer()
