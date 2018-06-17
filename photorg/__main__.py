@@ -15,7 +15,7 @@ class DatetimePattern:
     """
     PLACEHOLDERS = {
         '%Y': (r'\d{4}', 0),
-        '%y': (r'\d{2}', 0, lambda v: 2000+v),
+        '%y': (r'\d{2}', 0, lambda v, w: 2000+int(v)),
         '%m': (r'\d{1,2}', 1),
         '%d': (r'\d{1,2}', 2),
         '%H': (r'\d{1,2}', 3),
@@ -66,7 +66,7 @@ class DatetimePattern:
         vals = {}
         i = 0
         for ph in self.__placeholders:
-            val = int(m.group(i+1))
+            val = m.group(i+1)
             if ph in vals:
                 if vals[ph] != val:
                     raise ValueError("not all placeholder values are the same")
@@ -81,23 +81,25 @@ class DatetimePattern:
             if len(pdata) < 2:
                 continue
             pos = pdata[1]
-            w = struct[pos]
+            w = int(struct[pos])
             if ph in vals:
                 if len(pdata) > 2:
-                    w = pdata[1](vals[ph], w)
+                    w = pdata[2](vals[ph], w)
                 else:
-                    w = vals[ph]
+                    w = int(vals[ph])
             struct[pos] = w
         return datetime(*struct)
 
     def __process(self, m):
+        if not m:
+            return None
         vals = self.__get_placeholder_values(m)
-        val = self.__placeholder_values_to_time(vals)
+        timeval = self.__placeholder_values_to_time(vals)
         if self.__timefmt:
             cal = parsedatetime.Calendar()
-            val, _ = cal.parse(val.strftime(self.__timefmt))
-            val = datetime(*val[:7])
-        return val
+            timeval, _ = cal.parse(timeval.strftime(self.__timefmt))
+            timeval = datetime(*timeval[:7])
+        return timeval
 
     def search(self, string):
         m = re.search(self.__re, string)
@@ -206,6 +208,13 @@ class Organizer:
     def __log(self, msg, *args):
         print(msg % args)
 
+    def __output_path_exists(self, path, dry=False):
+        if dry and path in self.__opaths:
+            return True
+        if os.path.exists(path):
+            return True
+        return False
+
     def __process(
         self, path, outpattern, fromdir,
         inpatterns=None, outdir=None, faildir=None,
@@ -245,13 +254,14 @@ class Organizer:
         else:
             i = 1
             bopath, ext = os.path.splitext(opath)
-            while opath in self.__opaths or os.path.exists(opath):
-
+            while self.__output_path_exists(opath, dry):
                 opath = "%s-%s%s" % (bopath, i, ext)
                 i += 1
             if verbose:
                 self.__log("%s -> %s", path, opath)
-        if not dry:
+        if dry:
+            self.__opaths.append(opath)
+        else:
             if opath != path:
                 odir = os.path.dirname(opath)
                 if odir:
@@ -264,7 +274,6 @@ class Organizer:
                 if verbose:
                     self.__log("saving %s %s...", opath, timeval)
                 self.__save_exif_datetime(opath, timeval)
-
         return opath
 
     def run(self, args):
@@ -292,7 +301,7 @@ class Organizer:
                     fmime = self.__mime.from_file(fpath)
                     if not fmime.startswith("image/"):
                         continue
-                    opath = self.__process(
+                    self.__process(
                         path=fpath,
                         inpatterns=inpatterns,
                         outpattern=outpattern,
@@ -302,8 +311,6 @@ class Organizer:
                         dry=args.dry,
                         verbose=args.verbose,
                         move=move)
-                    if opath:
-                        self.__opaths.append(opath)
 
 
 def main():
