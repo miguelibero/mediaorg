@@ -5,6 +5,7 @@ import piexif
 from datetime import datetime
 import shutil
 import re
+import parsedatetime
 
 
 class DatetimePattern:
@@ -23,6 +24,7 @@ class DatetimePattern:
         '%S': r'\d{1,2}',
         '%p': r'am|pm|AM|PM',
     }
+    SEPARATOR = ';'
 
     def __find_placeholder(self, pattern, idx):
         midx = len(pattern)
@@ -37,6 +39,13 @@ class DatetimePattern:
         return (mph, mpre, midx)
 
     def __init__(self, pattern):
+        self.__pattern = pattern
+        timefmt = None
+        try:
+            pattern, timefmt = pattern.split(self.SEPARATOR, 2)
+        except ValueError:
+            pass
+        self.__timefmt = timefmt
         self.__placeholders = []
         idx = 0
         while True:
@@ -60,7 +69,11 @@ class DatetimePattern:
             s = m.span(len(phs)-i)
             timefrmt = timefrmt[0:s[0]] + ph + timefrmt[s[1]:]
             i += 1
-        return datetime.strptime(string, timefrmt)
+        time = datetime.strptime(string, timefrmt)
+        if self.__timefmt:
+            cal = parsedatetime.Calendar()
+            time = cal.parse(time.strftime(self.__timefmt))
+        return time
 
     def search(self, string):
         m = re.search(self.__re, string)
@@ -70,9 +83,14 @@ class DatetimePattern:
         m = re.match(self.__re, string)
         return self.__process(string, m)
 
+    def __repr__(self):
+        return "<DatetimePattern %s>" % (self.__pattern,)
+
+    def __str__(self):
+        return self.__repr__()
+
 
 class Organizer:
-
     FILE_PATTERNS = (
         DatetimePattern('WhatsApp Image %Y-%m-%d at %I.%M.%S %p'),
         DatetimePattern('WhatsApp Image %Y-%m-%d at %H.%M.%S'),
@@ -83,6 +101,7 @@ class Organizer:
     )
     EXIF_TAG = "Exif"
     DATETIME_ID = 36867
+    EXIF_DATE_FORMAT = '%Y:%m:%d %H:%M:%S'
 
     def __init__(self):
         self.__mime = magic.Magic(mime=True)
@@ -99,13 +118,20 @@ class Organizer:
         if self.DATETIME_ID not in data:
             return None
         data = data[self.DATETIME_ID].decode('utf-8')
-        return datetime.strptime(data, '%Y:%m:%d %H:%M:%S')
+        try:
+            return datetime.strptime(data, self.EXIF_DATE_FORMAT)
+        except ValueError:
+            pass
 
-    def __get_pattern_datetime(self, path):
-        for pattern in self.FILE_PATTERNS:
+    def __save_exif_datetime(self, path, time):
+        pass
+
+    def __get_pattern_datetime(self, path, patterns):
+        for pattern in patterns:
             time = pattern.search(path)
             if time:
-                return time
+                return (time, pattern)
+        return (None, None)
 
     def __get_output_path(self, path, time, pattern):
         return pattern.format(
@@ -114,38 +140,62 @@ class Organizer:
             ext=os.path.splitext(path)[1].lower()
         )
 
-    def __process(self, path, pattern, fromdir, outdir=None, faildir=None, dry=False):
+    def __log(self, msg, *args):
+        print(msg % args)
+
+    def __process(
+        self, path, outpattern, fromdir,
+        inpatterns=None, outdir=None, faildir=None,
+        dry=False, verbose=False,
+    ):
+        save = False
         time = self.__get_exif_datetime(path)
-        if not time:
-            time = self.__get_pattern_datetime(path)
+        if time and verbose:
+            self.__log("%s: exif %s", path, time)
+        if not time and inpatterns:
+            time, pattern = self.__get_pattern_datetime(path, inpatterns)
+            if time:
+                save = True
+                if verbose:
+                    self.__log("%s: %s %s", path, pattern, time)
+        
         opath = None
         if time:
-            opath = self.__get_output_path(path, time, pattern)
+            opath = self.__get_output_path(path, time, outpattern)
         elif faildir:
             if fromdir:
                 opath = os.path.relpath(path, fromdir)
-            print("failed %s" % (opath, ))
+            self.__log("failed %s", path)
             opath = os.path.join(faildir, opath)
 
         if not opath:
             return None
+
         opath = os.path.join(outdir, opath)
         i = 1
         bopath, ext = os.path.splitext(opath)
         while opath in self.__opaths:
             opath = "%s-%s%s" % (bopath, i, ext)
             i += 1
-        if dry:
-            print("%s -> %s" % (path, opath))
-        else:
+        if verbose:
+            self.__log("%s -> %s", path, opath)
+        if not dry:
             odir = os.path.dirname(opath)
             if odir:
                 os.makedirs(odir, exist_ok=True)
             shutil.copyfile(path, opath)
+            if save:
+                if verbose:
+                    self.__log("saving %s %s...", opath, time)
+                self.__save_exif_datetime(opath, time)
+
         return opath
 
     def run(self, args):
         self.__opaths = []
+        inpatterns = list(self.FILE_PATTERNS)
+        for pattern in args.inpattern:
+            inpatterns.append(DatetimePattern(pattern))
         for fromdir in args.path:
             print("processing %s to %s..." % (fromdir, args.outdir))
             outdir = os.path.join(fromdir, args.outdir)
@@ -158,22 +208,39 @@ class Organizer:
                         continue
                     opath = self.__process(
                         path=fpath,
-                        pattern=args.pattern,
+                        inpatterns=inpatterns,
+                        outpattern=args.outpattern,
                         fromdir=fromdir,
                         outdir=outdir,
                         faildir=faildir,
-                        dry=args.dry)
+                        dry=args.dry,
+                        verbose=args.verbose)
                     if opath:
                         self.__opaths.append(opath)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='organize your photo collection')
-    parser.add_argument('path', nargs='+', help='directory with photos', default='.')
-    parser.add_argument('-o,--outdir', dest='outdir', help='output directory')
-    parser.add_argument('-d,--dry', dest='dry', action='store_true', help='run without changing any files')
-    parser.add_argument('-p,--pattern', dest='pattern', help='output file pattern', default="{time:%Y}/{time:%Y-%m-%d}/{time:%Y-%m-%d_%H-%M}{ext}")
-    parser.add_argument('-f,--faildir', dest='faildir', help='fail output directory', default="./failed")
+    parser = argparse.ArgumentParser(
+        description='organize your photo collection')
+    parser.add_argument(
+        'path', nargs='+', help='directory with photos', default='.')
+    parser.add_argument(
+        '-o,--outdir', dest='outdir', help='output directory')
+    parser.add_argument(
+        '-d,--dry', dest='dry', action='store_true',
+        help='run without changing any files')
+    parser.add_argument(
+        '-v,--verbose', dest='verbose', action='store_true',
+        help='print more stuff')
+    parser.add_argument(
+        '-p,--outpattern', dest='outpattern', help='output file pattern',
+        default="{time:%Y}/{time:%Y-%m-%d}/{time:%Y-%m-%d_%H-%M}{ext}")
+    parser.add_argument(
+        '-f,--faildir', dest='faildir', help='fail output directory',
+        default="./failed")
+    parser.add_argument(
+        '--inpattern', nargs='+', dest="inpattern",
+        help='add aditional path pattern to find datetime')
     args = parser.parse_args()
     org = Organizer()
     org.run(args)

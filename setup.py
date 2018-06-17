@@ -17,6 +17,7 @@ setup(
     packages=['photorg'],
     install_requires=[
         "piexif >= 1.0.13",
+        "parsedatetime >= 2.4",
         "argparse >= 1.4.0",
         "python-magic >= 0.4.15"
     ]
