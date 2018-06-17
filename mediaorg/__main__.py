@@ -142,8 +142,7 @@ class OutputPattern:
         return self.__pattern.format(
             time=timeval,
             filename=os.path.basename(path),
-            ext=ext
-        )
+        ) + ext
 
     def match(self, path, basepath=None):
         if basepath:
@@ -170,17 +169,29 @@ class MediaFile:
     TIME_PATTERNS = (
         DatetimePattern('WhatsApp Image %Y-%m-%d at %I.%M.%S %p'),
         DatetimePattern('WhatsApp Image %Y-%m-%d at %H.%M.%S'),
+        DatetimePattern('WhatsApp Video %Y-%m-%d at %I.%M.%S %p'),
+        DatetimePattern('WhatsApp Video %Y-%m-%d at %H.%M.%S'),
         DatetimePattern('IMG_%Y%m%d_%H%M%S'),
         DatetimePattern('IMG-%Y%m%d-'),
+        DatetimePattern('VID_%Y%m%d_%H%M%S'),
+        DatetimePattern('VID-%Y%m%d-'),
         DatetimePattern('/%Y-%m-%d.*/'),
         DatetimePattern('-%d-%m-%Y( |\.)'),
     )
+
+    DEFAULT_SPAN = 'default'
+    SPANS = {
+        'day': 1,
+        'month': 30,
+        'year': 365,
+    }
 
     def __init__(self, path, patterns=None):
         if not isinstance(path, str):
             raise ValueError("path needs to be a string")
         self.__path = path
         self.__time = None
+        self.__difftime = None
         self.__method = None
         self.__now = datetime.now()
         if not patterns:
@@ -212,9 +223,14 @@ class MediaFile:
                 self.__method = self.METHOD_PATTERN
         return self.__time
 
-    def set_time(self, time):
-        self.__method = self.METHOD_MANUAL
-        self.__time = time
+    def set_time(self, time, difftime=None):
+        if time:
+            self.__method = self.METHOD_MANUAL
+            self.__time = time
+        else:
+            self.__method = None
+            self.__time = None
+        self.__difftime = difftime
 
     def __get_exif_datetime(self):
         try:
@@ -276,14 +292,32 @@ class MediaFile:
             return True
         return False
 
+    def get_span(self, patterns=None):
+        if self.__difftime:
+            for name, maxdiff in self.SPANS.items():
+                if self.__difftime < maxdiff:
+                    return name
+        return self.DEFAULT_SPAN
+
+    def __get_pattern(self, patterns=None):
+        if self.__difftime:
+            for name, maxdiff in self.SPANS.items():
+                if self.__difftime < maxdiff:
+                    if name in patterns:
+                        return patterns[name]
+        if self.DEFAULT_SPAN in patterns:
+            return patterns[self.DEFAULT_SPAN]
+
     def get_outpath(
-        self, pattern, outdir=None, fromdir=None,
+        self, patterns, outdir=None, fromdir=None,
         faildir=None, outpaths=None
     ):
         path = None
         if self.__time:
-            path = pattern.format(self.__path, self.__time)
-        elif faildir:
+            pattern = self.__get_pattern(patterns)
+            if pattern:
+                path = pattern.format(self.__path, self.__time)
+        if not path and faildir:
             if fromdir:
                 path = os.path.relpath(self.__path, fromdir)
             path = os.path.join(faildir, path)
@@ -303,8 +337,9 @@ class MediaFile:
         if self.get_method() == self.METHOD_EXIF:
             return "%s: exif %s" % (self.get_path(), self.get_time())
         if self.get_method() == self.METHOD_MANUAL:
-            return "%s: manual %s" % (self.get_path(), self.get_time())
-        elif self.get_method() == self.METHOD_EXIF:
+            return "%s: manual %s %s" % (
+                self.get_path(), self.get_span(), self.get_time())
+        elif self.get_method() == self.METHOD_PATTERN:
             return "%s: %s %s" % (
                 self.get_path(), self.get_pattern(), self.get_time())
         elif self.get_time():
@@ -314,7 +349,11 @@ class MediaFile:
 
 
 class Organizer:
-    EXTENSIONS = ('.jpg', '.jpeg', '.png', '.avi', '.mov', '.3gp', '.mpg', '.mpeg')
+    EXTENSIONS = (
+        '.jpg', '.jpeg', '.png', '.mp4',
+        '.avi', '.mov', '.3gp', '.mpg', '.mpeg'
+    )
+    SEPARATOR = ';'
 
     def __init__(self):
         self.__opaths = None
@@ -323,55 +362,81 @@ class Organizer:
         self.__mime = magic.Magic(mime=True)
 
     def __log(self, msg, *args):
-        print(msg % args)
+        if len(args) > 0:
+            msg = msg % args
+        print(msg)
 
-    def __load_file(self, path, verbose=False, main=True):
+    def __load_file(
+        self, path, patterns=None,
+        verbose=False, main=True
+    ):
         if path in self.__mfiles:
             mfile = self.__mfiles[path]
         else:
-            mfile = MediaFile(path)
+            mfile = MediaFile(path, patterns)
             self.__mfiles[path] = mfile
         if main and not mfile.get_time():
-            dirtime = self.__load_dir(os.path.dirname(path), verbose)
-            mfile.set_time(dirtime)
+            dirtime, dirdifftime = self.__load_dir(
+                path=os.path.dirname(path),
+                patterns=patterns,
+                verbose=verbose)
+            mfile.set_time(dirtime, dirdifftime)
         if main and verbose:
             self.__log(str(mfile))
         return mfile
 
-    def __load_dir(self, path, verbose=False):
+    def __load_dir(self, path, patterns, verbose=False):
         if path in self.__dirtimes:
             return self.__dirtimes[path]
-        total = 0
+        sumtime = 0
         count = 0
+        mintime = None
+        maxtime = None
         for fpath in os.listdir(path):
             fpath = os.path.join(path, fpath)
             if not os.path.isfile(fpath):
                 continue
-            mfile = self.__load_file(fpath, verbose, False)
+            mfile = self.__load_file(
+                path=fpath,
+                patterns=patterns,
+                verbose=verbose,
+                main=False)
             if mfile and mfile.get_time():
-                total += mfile.get_time().timestamp()
+                ts = mfile.get_time().timestamp()
+                if maxtime is None or ts > maxtime:
+                    maxtime = ts
+                if mintime is None or ts < mintime:
+                    mintime = ts
+                sumtime += ts
                 count += 1
+        difftime = None
+        if maxtime and mintime:
+            difftime = (maxtime - mintime) / (60 * 60 * 24)
         if count == 0:
             avg = None
         else:
-            avg = datetime.fromtimestamp(total / count)
-        self.__dirtimes[path] = avg
-        return avg
+            avg = datetime.fromtimestamp(sumtime / count)
+        self.__dirtimes[path] = (avg, difftime)
+        return avg, difftime
 
     def __process_file(
-        self, path, outpattern, fromdir,
+        self, path, outpatterns, fromdir,
         inpatterns=None, outdir=None, faildir=None,
         dry=False, verbose=False, move=False
     ):
-        if outpattern.match(path, outdir):
-            self.__log("skipping output %s...", path)
-            return None
+        for outpattern in outpatterns.values():
+            if outpattern.match(path, outdir):
+                self.__log("skipping output %s...", path)
+                return None
 
-        mfile = self.__load_file(path, verbose)
+        mfile = self.__load_file(
+            path=path,
+            patterns=inpatterns,
+            verbose=verbose)
         if not mfile.get_time():
             self.__log(str(mfile))
         opath = mfile.get_outpath(
-            pattern=outpattern,
+            patterns=outpatterns,
             fromdir=fromdir,
             outdir=outdir,
             faildir=faildir,
@@ -407,16 +472,20 @@ class Organizer:
         self.__mfiles = {}
         self.__dirtimes = {}
         inpatterns = []
-        if args.inpattern:
-            for pattern in args.inpattern:
-                inpatterns.append(DatetimePattern(pattern))
-        outpattern = OutputPattern(args.outpattern)
+        for pattern in args.inpattern:
+            inpatterns.append(DatetimePattern(pattern))
+        outpatterns = {}
+        for pattern in args.outpattern:
+            try:
+                name, pattern = pattern.split(self.SEPARATOR, 2)
+            except Exception:
+                name = "default"
+            outpatterns[name] = OutputPattern(pattern)
         for fromdir in args.path:
             if args.outdir:
                 outdir = os.path.join(fromdir, args.outdir)
             else:
                 outdir = fromdir
-
             move = outdir == fromdir
             if outdir == fromdir:
                 self.__log("processing %s...", fromdir)
@@ -432,13 +501,21 @@ class Organizer:
                     self.__process_file(
                         path=fpath,
                         inpatterns=inpatterns,
-                        outpattern=outpattern,
+                        outpatterns=outpatterns,
                         fromdir=fromdir,
                         outdir=outdir,
                         faildir=faildir,
                         dry=args.dry,
                         verbose=args.verbose,
                         move=move)
+
+
+DEFAULT_OUTPATTERN = (
+    "{time:%Y}/{time:%Y-%m}/{time:%Y-%m-%d_%H-%M}",
+    "day;{time:%Y}/{time:%Y-%m}/{time:%Y-%m-%d}",
+    "month;{time:%Y}/{time:%Y-%m}/{time:%Y-%m}",
+    "year;{time:%Y}/{time:%Y}",
+)
 
 
 def main():
@@ -455,8 +532,8 @@ def main():
         '-v,--verbose', dest='verbose', action='store_true',
         help='print more stuff')
     parser.add_argument(
-        '-p,--outpattern', dest='outpattern', help='output file pattern',
-        default="{time:%Y}/{time:%Y-%m-%d}/{time:%Y-%m-%d_%H-%M}{ext}")
+        '-p,--outpattern', action='append', dest='outpattern', help='output file pattern',
+        default=DEFAULT_OUTPATTERN)
     parser.add_argument(
         '-f,--faildir', dest='faildir', help='fail output directory',
         default="./failed")
