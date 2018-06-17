@@ -3,7 +3,6 @@ import magic
 import os
 import piexif
 from datetime import datetime
-import time
 import shutil
 import re
 import parsedatetime
@@ -15,15 +14,17 @@ class DatetimePattern:
     to get a datetime from a string.
     """
     PLACEHOLDERS = {
-        '%Y': r'\d{4}',
-        '%y': r'\d{2}',
-        '%m': r'\d{1,2}',
-        '%d': r'\d{1,2}',
-        '%H': r'\d{1,2}',
-        '%I': r'\d{1,2}',
-        '%M': r'\d{1,2}',
-        '%S': r'\d{1,2}',
-        '%p': r'am|pm|AM|PM',
+        '%Y': (r'\d{4}', 0),
+        '%y': (r'\d{2}', 0, lambda v: 2000+v),
+        '%m': (r'\d{1,2}', 1),
+        '%d': (r'\d{1,2}', 2),
+        '%H': (r'\d{1,2}', 3),
+        '%I': (r'\d{1,2}', 3),
+        '%M': (r'\d{1,2}', 4),
+        '%S': (r'\d{1,2}', 5),
+        '%p': (
+            r'am|pm|AM|PM', 3,
+            lambda v, w: w + (12 if v.lower() == "pm" else 0))
     }
     SEPARATOR = ';'
 
@@ -31,12 +32,12 @@ class DatetimePattern:
         midx = len(pattern)
         mph = None
         mpre = None
-        for ph, pre in self.PLACEHOLDERS.items():
+        for ph, phdata in self.PLACEHOLDERS.items():
             pidx = pattern.find(ph, idx)
             if pidx >= 0 and pidx <= midx:
                 midx = pidx
                 mph = ph
-                mpre = pre
+                mpre = phdata[0]
         return (mph, mpre, midx)
 
     def __init__(self, pattern):
@@ -59,31 +60,52 @@ class DatetimePattern:
             idx += len(pre)
         self.__re = re.compile(pattern)
 
-    def __process(self, string, m):
+    def __get_placeholder_values(self, m):
         if not m:
             return None
-        phs = list(self.__placeholders)
-        phs.reverse()
+        vals = {}
         i = 0
-        timefrmt = string
-        for ph in phs:
-            s = m.span(len(phs)-i)
-            timefrmt = timefrmt[0:s[0]] + ph + timefrmt[s[1]:]
+        for ph in self.__placeholders:
+            val = int(m.group(i+1))
+            if ph in vals:
+                if vals[ph] != val:
+                    raise ValueError("not all placeholder values are the same")
+            else:
+                vals[ph] = val
             i += 1
-        val = datetime.strptime(string, timefrmt)
+        return vals
+
+    def __placeholder_values_to_time(self, vals):
+        struct = [1, 1, 1, 0, 0, 0, 0]
+        for ph, pdata in self.PLACEHOLDERS.items():
+            if len(pdata) < 2:
+                continue
+            pos = pdata[1]
+            w = struct[pos]
+            if ph in vals:
+                if len(pdata) > 2:
+                    w = pdata[1](vals[ph], w)
+                else:
+                    w = vals[ph]
+            struct[pos] = w
+        return datetime(*struct)
+
+    def __process(self, m):
+        vals = self.__get_placeholder_values(m)
+        val = self.__placeholder_values_to_time(vals)
         if self.__timefmt:
             cal = parsedatetime.Calendar()
             val, _ = cal.parse(val.strftime(self.__timefmt))
-            val = datetime.fromtimestamp(time.mktime(val))
+            val = datetime(*val[:7])
         return val
 
     def search(self, string):
         m = re.search(self.__re, string)
-        return self.__process(string, m)
+        return self.__process(m)
 
     def match(self, string):
         m = re.match(self.__re, string)
-        return self.__process(string, m)
+        return self.__process(m)
 
     def __repr__(self):
         return "<DatetimePattern %s>" % (self.__pattern,)
@@ -105,11 +127,11 @@ class OutputPattern:
             repattern = re.sub(p, r, repattern)
         self.__re = DatetimePattern(repattern)
 
-    def format(self, path, time):
+    def format(self, path, timeval):
         _, ext = os.path.splitext(path)
         ext = ext.lower() if ext else ""
         return self.__pattern.format(
-            time=time,
+            time=timeval,
             filename=os.path.basename(path),
             ext=ext
         )
@@ -159,22 +181,26 @@ class Organizer:
         except ValueError:
             pass
 
-    def __save_exif_datetime(self, path, time):
+    def __save_exif_datetime(self, path, timeval):
         try:
             data = piexif.load(path)
         except Exception:
-            return
+            return False
         if self.EXIF_TAG not in data:
             data[self.EXIF_TAG] = {}
         exif = data[self.EXIF_TAG]
-        exif[self.DATETIME_ID] = time.strftime(self.EXIF_DATE_FORMAT)
-        piexif.insert(piexif.dump(data), path)
+        exif[self.DATETIME_ID] = timeval.strftime(self.EXIF_DATE_FORMAT)
+        try:
+            piexif.insert(piexif.dump(data), path)
+            return True
+        except Exception:
+            return False
 
     def __get_pattern_datetime(self, path, patterns):
         for pattern in patterns:
-            time = pattern.search(path)
-            if time:
-                return (time, pattern)
+            val = pattern.search(path)
+            if val:
+                return (val, pattern)
         return (None, None)
 
     def __log(self, msg, *args):
@@ -185,24 +211,25 @@ class Organizer:
         inpatterns=None, outdir=None, faildir=None,
         dry=False, verbose=False, move=False
     ):
-        if outpattern.match(path, outdir):
-            self.__log("skipping %s...", path)
+        timeval = outpattern.match(path, outdir)
+        if timeval:
+            self.__log("skipping output %s...", path)
             return
 
         save = False
-        time = self.__get_exif_datetime(path)
-        if time and verbose:
-            self.__log("%s: exif %s", path, time)
-        if not time and inpatterns:
-            time, pattern = self.__get_pattern_datetime(path, inpatterns)
-            if time:
+        timeval = self.__get_exif_datetime(path)
+        if timeval and verbose:
+            self.__log("%s: exif %s", path, timeval)
+        if not timeval and inpatterns:
+            timeval, pattern = self.__get_pattern_datetime(path, inpatterns)
+            if timeval:
                 save = True
                 if verbose:
-                    self.__log("%s: %s %s", path, pattern, time)
+                    self.__log("%s: %s %s", path, pattern, timeval)
 
         opath = None
-        if time:
-            opath = outpattern.format(path, time)
+        if timeval:
+            opath = outpattern.format(path, timeval)
         elif faildir:
             if fromdir:
                 opath = os.path.relpath(path, fromdir)
@@ -219,6 +246,7 @@ class Organizer:
             i = 1
             bopath, ext = os.path.splitext(opath)
             while opath in self.__opaths or os.path.exists(opath):
+
                 opath = "%s-%s%s" % (bopath, i, ext)
                 i += 1
             if verbose:
@@ -234,8 +262,8 @@ class Organizer:
                     shutil.copyfile(path, opath)
             if save:
                 if verbose:
-                    self.__log("saving %s %s...", opath, time)
-                self.__save_exif_datetime(opath, time)
+                    self.__log("saving %s %s...", opath, timeval)
+                self.__save_exif_datetime(opath, timeval)
 
         return opath
 
@@ -251,7 +279,7 @@ class Organizer:
                 outdir = os.path.join(fromdir, args.outdir)
             else:
                 outdir = fromdir
-            
+        
             move = outdir == fromdir
             if outdir == fromdir:
                 print("processing %s..." % (fromdir,))
