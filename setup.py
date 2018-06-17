@@ -16,7 +16,7 @@ setup(
     },
     packages=['photorg'],
     install_requires=[
-        "ExifRead >= 2.1.2",
+        "piexif >= 1.0.13",
         "argparse >= 1.4.0",
         "python-magic >= 0.4.15"
     ]
