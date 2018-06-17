@@ -1,11 +1,11 @@
 import argparse
-import magic
 import os
 import piexif
 from datetime import datetime
 import shutil
 import re
 import parsedatetime
+import magic
 
 
 class DatetimePattern:
@@ -13,6 +13,7 @@ class DatetimePattern:
     combines regular expressions and strftime markers
     to get a datetime from a string.
     """
+
     PLACEHOLDERS = {
         '%Y': (r'\d{4}', 0),
         '%y': (r'\d{2}', 0, lambda v, w: 2000+int(v)),
@@ -117,6 +118,12 @@ class DatetimePattern:
 
 
 class OutputPattern:
+    """
+    converts a string.format pattern into a DatetimePattern
+    used to format output paths and to check if the path
+    is already an output path
+    """
+
     REPLS = (
         (re.compile(r"\{([^:]+):([^}]*)\}"), "\\2"),
         (re.compile(r"\{([^}]*)\}"), "[^/]*")
@@ -150,8 +157,17 @@ class OutputPattern:
         return self.__repr__()
 
 
-class Organizer:
-    FILE_PATTERNS = (
+class MediaFile:
+
+    METHOD_EXIF = "exif"
+    METHOD_PATTERN = "pattern"
+    METHOD_MANUAL = "manual"
+
+    EXIF_TAG = "Exif"
+    DATETIME_ID = 36867
+    EXIF_DATE_FORMAT = '%Y:%m:%d %H:%M:%S'
+
+    TIME_PATTERNS = (
         DatetimePattern('WhatsApp Image %Y-%m-%d at %I.%M.%S %p'),
         DatetimePattern('WhatsApp Image %Y-%m-%d at %H.%M.%S'),
         DatetimePattern('IMG_%Y%m%d_%H%M%S'),
@@ -159,17 +175,50 @@ class Organizer:
         DatetimePattern('/%Y-%m-%d.*/'),
         DatetimePattern('-%d-%m-%Y( |\.)'),
     )
-    EXIF_TAG = "Exif"
-    DATETIME_ID = 36867
-    EXIF_DATE_FORMAT = '%Y:%m:%d %H:%M:%S'
 
-    def __init__(self):
-        self.__mime = magic.Magic(mime=True)
-        self.__opaths = None
+    def __init__(self, path, patterns=None):
+        if not isinstance(path, str):
+            raise ValueError("path needs to be a string")
+        self.__path = path
+        self.__time = None
+        self.__method = None
+        self.__now = datetime.now()
+        if not patterns:
+            patterns = []
+        patterns.extend(self.TIME_PATTERNS)
+        self.__patterns = patterns
 
-    def __get_exif_datetime(self, path):
+    def get_method(self):
+        self.get_time()
+        return self.__method
+
+    def get_path(self):
+        return self.__path
+
+    def get_pattern(self):
+        self.get_time()
+        return self.__pattern
+
+    def get_time(self):
+        if self.__time:
+            return self.__time
+        self.__time = self.__get_exif_datetime()
+        if self.__time:
+            self.__method = self.METHOD_EXIF
+            return self.__time
+        if self.__patterns:
+            self.__time, self.__pattern = self.__get_pattern_datetime()
+            if self.__time:
+                self.__method = self.METHOD_PATTERN
+        return self.__time
+
+    def set_time(self, time):
+        self.__method = self.METHOD_MANUAL
+        self.__time = time
+
+    def __get_exif_datetime(self):
         try:
-            data = piexif.load(path)
+            data = piexif.load(self.__path)
         except Exception:
             return None
         if self.EXIF_TAG not in data:
@@ -179,106 +228,185 @@ class Organizer:
             return None
         data = data[self.DATETIME_ID].decode('utf-8')
         try:
-            return datetime.strptime(data, self.EXIF_DATE_FORMAT)
+            timeval = datetime.strptime(data, self.EXIF_DATE_FORMAT)
+            if timeval < self.__now:
+                return timeval
         except ValueError:
             pass
 
-    def __save_exif_datetime(self, path, timeval):
-        try:
-            data = piexif.load(path)
-        except Exception:
-            return False
+    def __save_exif_datetime(self, path=None):
+        if not path:
+            path = self.__path
+        data = piexif.load(path)
         if self.EXIF_TAG not in data:
             data[self.EXIF_TAG] = {}
         exif = data[self.EXIF_TAG]
-        exif[self.DATETIME_ID] = timeval.strftime(self.EXIF_DATE_FORMAT)
+        exif[self.DATETIME_ID] = self.__time.strftime(self.EXIF_DATE_FORMAT)
+        piexif.insert(piexif.dump(data), path)
+
+    def __get_pattern_datetime(self):
+        for pattern in self.__patterns:
+            timeval = pattern.search(self.__path)
+            if timeval and timeval < self.__now:
+                return (timeval, pattern)
+        return (None, None)
+
+    def save(self, path, move=False):
+        pdir = os.path.dirname(path)
+        if dir:
+            os.makedirs(pdir, exist_ok=True)
+        if move:
+            shutil.move(self.__path, path)
+            self.__path = path
+        else:
+            shutil.copyfile(self.__path, path)
+        if self.__method == self.METHOD_EXIF:
+            return True
         try:
-            piexif.insert(piexif.dump(data), path)
+            self.__save_exif_datetime(path)
+            self.__method = self.METHOD_EXIF
             return True
         except Exception:
             return False
 
-    def __get_pattern_datetime(self, path, patterns):
-        for pattern in patterns:
-            val = pattern.search(path)
-            if val:
-                return (val, pattern)
-        return (None, None)
-
-    def __log(self, msg, *args):
-        print(msg % args)
-
-    def __output_path_exists(self, path, dry=False):
-        if dry and path in self.__opaths:
+    def __path_exists(self, path, paths=None):
+        if paths and path in paths:
             return True
         if os.path.exists(path):
             return True
         return False
 
-    def __process(
+    def get_outpath(
+        self, pattern, outdir=None, fromdir=None,
+        faildir=None, outpaths=None
+    ):
+        path = None
+        if self.__time:
+            path = pattern.format(self.__path, self.__time)
+        elif faildir:
+            if fromdir:
+                path = os.path.relpath(self.__path, fromdir)
+            path = os.path.join(faildir, path)
+
+        if outdir:
+            path = os.path.join(outdir, path)
+        if path == self.__path:
+            return None
+        i = 1
+        bpath, ext = os.path.splitext(path)
+        while self.__path_exists(path, outpaths):
+            path = "%s-%s%s" % (bpath, i, ext)
+            i += 1
+        return path
+
+    def __str__(self):
+        if self.get_method() == self.METHOD_EXIF:
+            return "%s: exif %s" % (self.get_path(), self.get_time())
+        if self.get_method() == self.METHOD_MANUAL:
+            return "%s: manual %s" % (self.get_path(), self.get_time())
+        elif self.get_method() == self.METHOD_EXIF:
+            return "%s: %s %s" % (
+                self.get_path(), self.get_pattern(), self.get_time())
+        elif self.get_time():
+            return "%s: %s" % (self.get_path(), self.get_time())
+        else:
+            return "%s: failed" % (self.get_path())
+
+
+class Organizer:
+    EXTENSIONS = ('.jpg', '.jpeg', '.png', '.avi', '.mov', '.3gp', '.mpg', '.mpeg')
+
+    def __init__(self):
+        self.__opaths = None
+        self.__mfiles = None
+        self.__dirtimes = None
+        self.__mime = magic.Magic(mime=True)
+
+    def __log(self, msg, *args):
+        print(msg % args)
+
+    def __load_file(self, path, verbose=False, main=True):
+        if path in self.__mfiles:
+            mfile = self.__mfiles[path]
+        else:
+            mfile = MediaFile(path)
+            self.__mfiles[path] = mfile
+        if main and not mfile.get_time():
+            dirtime = self.__load_dir(os.path.dirname(path), verbose)
+            mfile.set_time(dirtime)
+        if main and verbose:
+            self.__log(str(mfile))
+        return mfile
+
+    def __load_dir(self, path, verbose=False):
+        if path in self.__dirtimes:
+            return self.__dirtimes[path]
+        total = 0
+        count = 0
+        for fpath in os.listdir(path):
+            fpath = os.path.join(path, fpath)
+            if not os.path.isfile(fpath):
+                continue
+            mfile = self.__load_file(fpath, verbose, False)
+            if mfile and mfile.get_time():
+                total += mfile.get_time().timestamp()
+                count += 1
+        if count == 0:
+            avg = None
+        else:
+            avg = datetime.fromtimestamp(total / count)
+        self.__dirtimes[path] = avg
+        return avg
+
+    def __process_file(
         self, path, outpattern, fromdir,
         inpatterns=None, outdir=None, faildir=None,
         dry=False, verbose=False, move=False
     ):
-        timeval = outpattern.match(path, outdir)
-        if timeval:
+        if outpattern.match(path, outdir):
             self.__log("skipping output %s...", path)
-            return
-
-        save = False
-        timeval = self.__get_exif_datetime(path)
-        if timeval and verbose:
-            self.__log("%s: exif %s", path, timeval)
-        if not timeval and inpatterns:
-            timeval, pattern = self.__get_pattern_datetime(path, inpatterns)
-            if timeval:
-                save = True
-                if verbose:
-                    self.__log("%s: %s %s", path, pattern, timeval)
-
-        opath = None
-        if timeval:
-            opath = outpattern.format(path, timeval)
-        elif faildir:
-            if fromdir:
-                opath = os.path.relpath(path, fromdir)
-            self.__log("failed %s", path)
-            opath = os.path.join(faildir, opath)
-
-        if not opath:
             return None
-        opath = os.path.join(outdir, opath)
-        if opath == path:
+
+        mfile = self.__load_file(path, verbose)
+        if not mfile.get_time():
+            self.__log(str(mfile))
+        opath = mfile.get_outpath(
+            pattern=outpattern,
+            fromdir=fromdir,
+            outdir=outdir,
+            faildir=faildir,
+            outpaths=self.__opaths
+        )
+        if not opath:
             if verbose:
-                self.__log("skipping operation %s...", opath)
-        else:
-            i = 1
-            bopath, ext = os.path.splitext(opath)
-            while self.__output_path_exists(opath, dry):
-                opath = "%s-%s%s" % (bopath, i, ext)
-                i += 1
-            if verbose:
-                self.__log("%s -> %s", path, opath)
+                self.__log("skipping operation %s...", path)
+            return None
         if dry:
             self.__opaths.append(opath)
         else:
-            if opath != path:
-                odir = os.path.dirname(opath)
-                if odir:
-                    os.makedirs(odir, exist_ok=True)
-                if move:
-                    shutil.move(path, opath)
-                else:
-                    shutil.copyfile(path, opath)
-            if save:
-                if verbose:
-                    self.__log("saving %s %s...", opath, timeval)
-                self.__save_exif_datetime(opath, timeval)
+            mfile.save(opath, move)
         return opath
+
+    def __is_valid_type(self, path, exts):
+        _, ext = os.path.splitext(path)
+        if ext:
+            ext = ext.lower()
+        if exts and ext in exts:
+            return True
+        if ext in self.EXTENSIONS:
+            return True
+        mime = self.__mime.from_file(path)
+        if mime.startswith("image/"):
+            return True
+        if mime.startswith("video/"):
+            return True
 
     def run(self, args):
         self.__opaths = []
-        inpatterns = list(self.FILE_PATTERNS)
+        self.__now = datetime.now()
+        self.__mfiles = {}
+        self.__dirtimes = {}
+        inpatterns = []
         if args.inpattern:
             for pattern in args.inpattern:
                 inpatterns.append(DatetimePattern(pattern))
@@ -288,20 +416,20 @@ class Organizer:
                 outdir = os.path.join(fromdir, args.outdir)
             else:
                 outdir = fromdir
-        
+
             move = outdir == fromdir
             if outdir == fromdir:
-                print("processing %s..." % (fromdir,))
+                self.__log("processing %s...", fromdir)
             else:
-                print("processing %s to %s..." % (fromdir, outdir))
+                self.__log("processing %s to %s...", fromdir, outdir)
             faildir = os.path.join(outdir, args.faildir)
             for froot, _, fpaths in os.walk(fromdir):
                 for fpath in fpaths:
                     fpath = os.path.join(froot, fpath)
-                    fmime = self.__mime.from_file(fpath)
-                    if not fmime.startswith("image/"):
+                    if not self.__is_valid_type(fpath, args.extension):
+                        self.__log("skipping type %s...", fpath)
                         continue
-                    self.__process(
+                    self.__process_file(
                         path=fpath,
                         inpatterns=inpatterns,
                         outpattern=outpattern,
@@ -315,9 +443,9 @@ class Organizer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='organize your photo collection')
+        description='organize your media collection')
     parser.add_argument(
-        'path', action='append', help='directory with photos', default=[])
+        'path', action='append', help='directory with files', default=[])
     parser.add_argument(
         '-o,--outdir', dest='outdir', help='output directory')
     parser.add_argument(
@@ -335,6 +463,9 @@ def main():
     parser.add_argument(
         '--inpattern', action='append', dest="inpattern",
         help='add aditional path pattern to find datetime')
+    parser.add_argument(
+        '--ext,--extension', action='append', dest="extension",
+        help='additional extension to organize')
     args = parser.parse_args()
     org = Organizer()
     org.run(args)
