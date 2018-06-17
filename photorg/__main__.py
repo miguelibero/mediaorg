@@ -8,6 +8,7 @@ import shutil
 import re
 import parsedatetime
 
+
 class DatetimePattern:
     """
     combines regular expressions and strftime markers
@@ -91,6 +92,40 @@ class DatetimePattern:
         return self.__repr__()
 
 
+class OutputPattern:
+    REPLS = (
+        (re.compile(r"\{([^:]+):([^}]*)\}"), "\\2"),
+        (re.compile(r"\{([^}]*)\}"), "[^/]*")
+    )
+
+    def __init__(self, pattern):
+        self.__pattern = pattern
+        repattern = pattern
+        for p, r in self.REPLS:
+            repattern = re.sub(p, r, repattern)
+        self.__re = DatetimePattern(repattern)
+
+    def format(self, path, time):
+        _, ext = os.path.splitext(path)
+        ext = ext.lower() if ext else ""
+        return self.__pattern.format(
+            time=time,
+            filename=os.path.basename(path),
+            ext=ext
+        )
+
+    def match(self, path, basepath=None):
+        if basepath:
+            path = os.path.relpath(path, basepath)
+        return self.__re.match(path)
+
+    def __repr__(self):
+        return "<OutputPattern %s>" % (self.__pattern,)
+
+    def __str__(self):
+        return self.__repr__()
+
+
 class Organizer:
     FILE_PATTERNS = (
         DatetimePattern('WhatsApp Image %Y-%m-%d at %I.%M.%S %p'),
@@ -142,15 +177,6 @@ class Organizer:
                 return (time, pattern)
         return (None, None)
 
-    def __get_output_path(self, path, time, pattern):
-        _, ext = os.path.splitext(path)
-        ext = ext.lower() if ext else ""
-        return pattern.format(
-            time=time,
-            filename=os.path.basename(path),
-            ext=ext
-        )
-
     def __log(self, msg, *args):
         print(msg % args)
 
@@ -159,6 +185,10 @@ class Organizer:
         inpatterns=None, outdir=None, faildir=None,
         dry=False, verbose=False, move=False
     ):
+        if outpattern.match(path, outdir):
+            self.__log("skipping %s...", path)
+            return
+
         save = False
         time = self.__get_exif_datetime(path)
         if time and verbose:
@@ -172,7 +202,7 @@ class Organizer:
 
         opath = None
         if time:
-            opath = self.__get_output_path(path, time, outpattern)
+            opath = outpattern.format(path, time)
         elif faildir:
             if fromdir:
                 opath = os.path.relpath(path, fromdir)
@@ -184,7 +214,7 @@ class Organizer:
         opath = os.path.join(outdir, opath)
         if opath == path:
             if verbose:
-                self.__log("skipping %s...", opath)
+                self.__log("skipping operation %s...", opath)
         else:
             i = 1
             bopath, ext = os.path.splitext(opath)
@@ -215,6 +245,7 @@ class Organizer:
         if args.inpattern:
             for pattern in args.inpattern:
                 inpatterns.append(DatetimePattern(pattern))
+        outpattern = OutputPattern(args.outpattern)
         for fromdir in args.path:
             if args.outdir:
                 outdir = os.path.join(fromdir, args.outdir)
@@ -236,7 +267,7 @@ class Organizer:
                     opath = self.__process(
                         path=fpath,
                         inpatterns=inpatterns,
-                        outpattern=args.outpattern,
+                        outpattern=outpattern,
                         fromdir=fromdir,
                         outdir=outdir,
                         faildir=faildir,
