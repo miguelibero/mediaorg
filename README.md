@@ -14,12 +14,12 @@ Patterns to detect a datetime of a file are a mix of regular expressions with da
 The default ones are:
 
 ```
-/WhatsApp Image %Y-%m-%d at %I.%M.%S %p
-/WhatsApp Image %Y-%m-%d at %H.%M.%S
-/IMG_%Y%m%d_%H%M%S
-/IMG-%Y%m%d-
-/%Y-%m-%d.*/
-'-%d-%m-%Y( |\.)
+WhatsApp (Image|Video) %Y-%m-%d at %I.%M.%S %p
+WhatsApp (Image|Video) %Y-%m-%d at %H.%M.%S
+(IMG|VID)_%Y%m%d_%H%M%S
+(IMG|VID)-%Y%m%d
+%Y-%m-%d
+%d-%m-%Y
 ```
 
 You can specify additional ones by passing one or more `--inpattern` parameters through the command line.
@@ -29,6 +29,8 @@ and it also works with placeholders. For example `/holidays %Y/;%Y-08-15` would 
 with the date of August the 15th.
 
 
-## TODO
+## Datetime Average
 
-* allow for parenthesis inside DatetimePattern
+If there is a media file in a folder that does not have exif information nor matches any pattern, mediaorg will take an average of the datetimes
+of the files in the same folder and a variation that can be day, month or year. Depending on the variation the file will be written to the 
+corresponding output pattern. You can modify a specific oputput pattern by passing a `--outpattern` parameter.

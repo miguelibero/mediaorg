@@ -41,6 +41,9 @@ class DatetimePattern:
                 mpre = phdata[0]
         return (mph, mpre, midx)
 
+    def __get_group(self, i):
+        return "dtptn%d" % (i,)
+
     def __init__(self, pattern):
         self.__pattern = pattern
         timefmt = None
@@ -51,11 +54,13 @@ class DatetimePattern:
         self.__timefmt = timefmt
         self.__placeholders = []
         idx = 0
+        i = 0
         while True:
             ph, pre, idx = self.__find_placeholder(pattern, idx)
             if not ph:
                 break
-            pre = "(" + pre + ")"
+            pre = "(?P<%s>%s)" % (self.__get_group(i), pre)
+            i += 1
             pattern = pattern[0:idx] + pre + pattern[idx+len(ph):]
             self.__placeholders.append(ph)
             idx += len(pre)
@@ -67,7 +72,7 @@ class DatetimePattern:
         vals = {}
         i = 0
         for ph in self.__placeholders:
-            val = m.group(i+1)
+            val = m.group(self.__get_group(i))
             if ph in vals:
                 if vals[ph] != val:
                     raise ValueError("not all placeholder values are the same")
@@ -167,14 +172,11 @@ class MediaFile:
     EXIF_DATE_FORMAT = '%Y:%m:%d %H:%M:%S'
 
     TIME_PATTERNS = (
-        DatetimePattern('WhatsApp Image %Y-%m-%d at %I.%M.%S %p'),
-        DatetimePattern('WhatsApp Image %Y-%m-%d at %H.%M.%S'),
-        DatetimePattern('WhatsApp Video %Y-%m-%d at %I.%M.%S %p'),
-        DatetimePattern('WhatsApp Video %Y-%m-%d at %H.%M.%S'),
-        DatetimePattern('IMG_%Y%m%d_%H%M%S'),
-        DatetimePattern('IMG-%Y%m%d-'),
-        DatetimePattern('VID_%Y%m%d_%H%M%S'),
-        DatetimePattern('VID-%Y%m%d-'),
+        DatetimePattern('/WhatsApp (Image|Video) %Y-%m-%d at %I.%M.%S %p'),
+        DatetimePattern('/WhatsApp (Image|Video) %Y-%m-%d at %H.%M.%S'),
+        DatetimePattern('/(IMG|VID)_%Y%m%d_%H%M%S'),
+        DatetimePattern('/%Y-%m-%d %H-%M-%S'),
+        DatetimePattern('/(IMG|VID)-%Y%m%d-'),
         DatetimePattern('/%Y-%m-%d.*/'),
         DatetimePattern('-%d-%m-%Y( |\.)'),
     )
@@ -532,8 +534,8 @@ def main():
         '-v,--verbose', dest='verbose', action='store_true',
         help='print more stuff')
     parser.add_argument(
-        '-p,--outpattern', action='append', dest='outpattern', help='output file pattern',
-        default=DEFAULT_OUTPATTERN)
+        '-p,--outpattern', action='append', dest='outpattern',
+        help='output file pattern', default=DEFAULT_OUTPATTERN)
     parser.add_argument(
         '-f,--faildir', dest='faildir', help='fail output directory',
         default="./failed")
